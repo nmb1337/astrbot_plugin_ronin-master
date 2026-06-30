@@ -1,0 +1,44 @@
+{
+  "api_base_url": {
+    "description": "金十新闻 API 地址",
+    "type": "string",
+    "default": "https://1b8d6028d99849668a6d8755c79e650f.z3c.jin10.com/top/flashsByTime",
+    "hint": "金十重要新闻的数据接口地址，一般无需修改。"
+  },
+  "app_id": {
+    "description": "API App ID",
+    "type": "string",
+    "default": "EzF2s2HxxU0U5bYa",
+    "hint": "金十 API 的 x-app-id 请求头，一般无需修改。"
+  },
+  "x_version": {
+    "description": "API 版本号",
+    "type": "string",
+    "default": "1.0.0",
+    "hint": "金十 API 的 x-version 请求头，一般无需修改。"
+  },
+  "default_count": {
+    "description": "默认获取新闻条数",
+    "type": "int",
+    "default": 5,
+    "hint": "用户使用 /jin10 不带参数时默认返回的新闻条数。"
+  },
+  "max_count": {
+    "description": "最大获取新闻条数",
+    "type": "int",
+    "default": 20,
+    "hint": "单次最多返回的新闻条数上限。"
+  },
+  "push_enabled": {
+    "description": "启用自动推送",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，插件启动时会自动轮询金十 API，将新新闻推送到订阅群组。"
+  },
+  "push_interval": {
+    "description": "推送轮询间隔（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "多久检查一次新新闻，默认 60 秒。请勿设置过短以免触发 API 限流。"
+  }
+}
