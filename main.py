@@ -10,12 +10,25 @@ from astrbot.api import AstrBotConfig
 KV_KEY_SUBSCRIPTIONS = "push_subscriptions"
 KV_KEY_LAST_NEWS_ID = "last_news_id"
 
+# 各平台单条消息字符数上限（留一些余量）
+PLATFORM_MAX_CHARS = {
+    "wecom": 2048,      # 企业微信
+    "wecom_ai_bot": 2048,
+    "aiocqhttp": 4500,  # QQ
+    "qq_official": 2000,
+    "telegram": 4096,
+    "dingtalk": 2000,
+    "lark": 3000,
+    "discord": 2000,
+}
+
 
 class Jin10NewsPlugin(Star):
     """金十数据重要新闻插件
 
     通过 /jin10 指令获取金十数据的重要新闻快讯。
-    支持 /jin10 watch 订阅群组自动推送新新闻。
+    支持 /jin10_watch 订阅群组自动推送新新闻。
+    适配企业微信、QQ、Telegram 等所有 AstrBot 支持平台。
     数据来源：https://topic17z2k407.jin10.com/topic/jin10_important_news.html
     """
 
@@ -29,6 +42,7 @@ class Jin10NewsPlugin(Star):
         self.max_count = config.get("max_count", 20)
         self.push_enabled = config.get("push_enabled", True)
         self.push_interval = config.get("push_interval", 60)
+        self.content_max_length = config.get("content_max_length", 0)
         self._poll_task: asyncio.Task | None = None
 
     async def initialize(self):
@@ -43,13 +57,12 @@ class Jin10NewsPlugin(Star):
     @staticmethod
     def _strip_html(text: str) -> str:
         """去除 HTML 标签，<br/> 转为换行"""
-        text = re.sub(r'<br\\s*/?>', '\n', text)
+        text = re.sub(r'<br\s*/?>', '\n', text)
         text = re.sub(r'<[^>]+>', '', text)
         text = text.replace('&nbsp;', ' ')
         return text.strip()
 
-    @staticmethod
-    def _format_news_item(index: int, item: dict) -> str:
+    def _format_news_item(self, index: int, item: dict) -> str:
         """格式化单条新闻"""
         data = item.get("data", {})
         time_str = data.get("time", "未知时间")
@@ -57,8 +70,8 @@ class Jin10NewsPlugin(Star):
         title = inner.get("title", "")
         content = inner.get("content", "")
 
-        title = Jin10NewsPlugin._strip_html(title)
-        content = Jin10NewsPlugin._strip_html(content)
+        title = self._strip_html(title)
+        content = self._strip_html(content)
 
         if not title and content:
             match = re.match(r'【(.+?)】', content)
@@ -69,8 +82,9 @@ class Jin10NewsPlugin(Star):
         lines = [f"📰 #{index} {title}" if title else f"📰 #{index}"]
         lines.append(f"🕐 {time_str}")
         if content:
-            if len(content) > 300:
-                content = content[:300] + "..."
+            limit = self.content_max_length
+            if limit > 0 and len(content) > limit:
+                content = content[:limit] + "……"
             lines.append(content)
         return "\n".join(lines)
 
@@ -137,7 +151,7 @@ class Jin10NewsPlugin(Star):
     # ──────────────── 后台轮询 ────────────────
 
     async def _polling_loop(self):
-        """后台轮询任务：定时检查新新闻并推送到订阅群组"""
+        """后台轮询任务：定时检查新新闻并逐条推送到订阅群组"""
         while True:
             try:
                 await asyncio.sleep(self.push_interval)
@@ -167,19 +181,17 @@ class Jin10NewsPlugin(Star):
                 # 更新最新 ID
                 await self.put_kv_data(KV_KEY_LAST_NEWS_ID, self._get_news_id(news_list[0]))
 
-                # 构建推送消息
-                push_text = f"🔔 金十数据 · 新重要新闻（{len(new_items)} 条）\n\n"
+                # 逐条推送（旧→新顺序），避免单条消息过长被平台截断
+                count = len(new_items)
                 for i, item in enumerate(reversed(new_items), 1):
-                    push_text += self._format_news_item(i, item) + "\n"
-                    push_text += "─" * 30 + "\n"
-
-                # 推送到所有订阅会话
-                for umo in subscriptions:
-                    try:
-                        chain = MessageChain().message(push_text.rstrip("\n"))
-                        await self.context.send_message(umo, chain)
-                    except Exception as e:
-                        logger.error(f"推送消息到 {umo[:30]}... 失败: {e}")
+                    header = f"🔔 金十数据 · 重要新闻 ({i}/{count})\n\n" if i == 1 else ""
+                    text = header + self._format_news_item(i, item)
+                    for umo in subscriptions:
+                        try:
+                            chain = MessageChain().message(text)
+                            await self.context.send_message(umo, chain)
+                        except Exception as e:
+                            logger.error(f"推送消息到 {umo[:30]}... 失败: {e}")
 
             except asyncio.CancelledError:
                 logger.info("金十新闻后台轮询任务已取消")
@@ -206,12 +218,11 @@ class Jin10NewsPlugin(Star):
             yield event.plain_result("📭 当前暂无重要新闻。")
             return
 
-        output_lines = [f"📢 金十数据 · 重要新闻（最近 {len(news_list)} 条）\n"]
+        # 逐条发送，保证每条全文展示
         for i, item in enumerate(news_list, 1):
-            output_lines.append(self._format_news_item(i, item))
-            output_lines.append("─" * 30)
-
-        yield event.plain_result("\n".join(output_lines))
+            header = f"📢 金十数据 · 重要新闻 ({i}/{len(news_list)})\n\n" if i == 1 else ""
+            text = header + self._format_news_item(i, item)
+            yield event.plain_result(text)
 
     @filter.command("jin10_watch")
     async def watch_news(self, event: AstrMessageEvent):
@@ -249,6 +260,7 @@ class Jin10NewsPlugin(Star):
             "📊 金十新闻 · 推送状态",
             f"▪ 自动推送：{'✅ 已启用' if self.push_enabled else '❌ 已禁用'}",
             f"▪ 轮询间隔：{self.push_interval} 秒",
+            f"▪ 内容长度限制：{'无限制' if self.content_max_length <= 0 else str(self.content_max_length) + ' 字'}",
             f"▪ 本群订阅：{'✅ 已订阅' if subscribed else '❌ 未订阅'}",
             f"▪ 订阅总数：{len(subscriptions)} 个群",
             f"▪ 已记录最新：{last_id[:20] + '...' if last_id else '无'}",
