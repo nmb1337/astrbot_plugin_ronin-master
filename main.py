@@ -8,19 +8,13 @@ from astrbot.api import logger
 from astrbot.api import AstrBotConfig
 
 KV_KEY_SUBSCRIPTIONS = "push_subscriptions"
-KV_KEY_LAST_NEWS_ID = "last_news_id"
+KV_KEY_KNOWN_IDS = "known_news_ids"
+MAX_KNOWN_IDS = 500  # 最多记录多少条已推送 ID
 
-# 各平台单条消息字符数上限（留一些余量）
-PLATFORM_MAX_CHARS = {
-    "wecom": 2048,      # 企业微信
-    "wecom_ai_bot": 2048,
-    "aiocqhttp": 4500,  # QQ
-    "qq_official": 2000,
-    "telegram": 4096,
-    "dingtalk": 2000,
-    "lark": 3000,
-    "discord": 2000,
-}
+# "点击查看" 类新闻的详情页 URL 模板
+JIN10_DETAIL_URL = "https://flash.jin10.com/detail/{item_id}"
+# 金十详情页 API（如果存在的话，比抓 HTML 更干净）
+JIN10_DETAIL_API = "https://xnews.jin10.com/api/details/{numeric_id}"
 
 
 class Jin10NewsPlugin(Star):
@@ -28,6 +22,7 @@ class Jin10NewsPlugin(Star):
 
     通过 /jin10 指令获取金十数据的重要新闻快讯。
     支持 /jin10_watch 订阅群组自动推送新新闻。
+    自动抓取"点击查看"类新闻的全文内容。
     适配企业微信、QQ、Telegram 等所有 AstrBot 支持平台。
     数据来源：https://topic17z2k407.jin10.com/topic/jin10_important_news.html
     """
@@ -43,6 +38,7 @@ class Jin10NewsPlugin(Star):
         self.push_enabled = config.get("push_enabled", True)
         self.push_interval = config.get("push_interval", 60)
         self.content_max_length = config.get("content_max_length", 0)
+        self.fetch_detail = config.get("fetch_detail", True)
         self._poll_task: asyncio.Task | None = None
 
     async def initialize(self):
@@ -62,7 +58,7 @@ class Jin10NewsPlugin(Star):
         text = text.replace('&nbsp;', ' ')
         return text.strip()
 
-    def _format_news_item(self, index: int, item: dict) -> str:
+    def _format_news_item(self, index: int, item: dict, full_content: str = "") -> str:
         """格式化单条新闻"""
         data = item.get("data", {})
         time_str = data.get("time", "未知时间")
@@ -78,6 +74,10 @@ class Jin10NewsPlugin(Star):
             if match:
                 title = match.group(1)
                 content = content[content.index('】') + 1:].strip()
+
+        # 如果有抓取到的全文，使用全文替代摘要
+        if full_content:
+            content = full_content
 
         lines = [f"📰 #{index} {title}" if title else f"📰 #{index}"]
         lines.append(f"🕐 {time_str}")
@@ -116,6 +116,101 @@ class Jin10NewsPlugin(Star):
         """从新闻条目中提取唯一标识"""
         return item.get("item_id", "") or item.get("data", {}).get("id", "")
 
+    # ──────────────── 详情页抓取 ────────────────
+
+    async def _fetch_article_detail(self, item_id: str, item: dict) -> str:
+        """抓取"点击查看"类新闻的全文内容
+
+        通过 flash.jin10.com/detail/{item_id} 获取详情页，
+        提取正文段落。失败时返回空字符串。
+        """
+        if not self.fetch_detail:
+            return ""
+
+        url = JIN10_DETAIL_URL.format(item_id=item_id)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                # allow_redirects=True 自动跟随 302 跳转
+                async with session.get(url, headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=10),
+                                       allow_redirects=True) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"抓取详情页失败 {url}: HTTP {resp.status}")
+                        return ""
+                    html = await resp.text()
+
+            # 从 HTML 中提取正文段落
+            content = self._extract_article_text(html)
+            if content:
+                logger.info(f"成功抓取详情全文 {item_id}: {len(content)} 字")
+            return content
+
+        except asyncio.TimeoutError:
+            logger.warning(f"抓取详情页超时 {item_id}")
+            return ""
+        except Exception as e:
+            logger.warning(f"抓取详情页异常 {item_id}: {e}")
+            return ""
+
+    @staticmethod
+    def _extract_article_text(html: str) -> str:
+        """从 xnews.jin10.com 详情页 HTML 中提取正文纯文本"""
+        # 尝试匹配 <div class="content">...</div> 或 <article>...</article>
+        # 金十 xnews 页面正文通常在 <div class="details-content"> 或类似结构中
+        patterns = [
+            r'<div[^>]*class="[^"]*details-content[^"]*"[^>]*>(.*?)</div>',
+            r'<div[^>]*class="[^"]*article-content[^"]*"[^>]*>(.*?)</div>',
+            r'<div[^>]*class="[^"]*content\s+detail[^"]*"[^>]*>(.*?)</div>',
+            r'<article[^>]*>(.*?)</article>',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
+            if match:
+                text = match.group(1)
+                # 清理 HTML 标签
+                text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL)
+                text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
+                text = re.sub(r'<br\s*/?>', '\n', text)
+                text = re.sub(r'</?p[^>]*>', '\n', text)
+                text = re.sub(r'</?div[^>]*>', '\n', text)
+                text = re.sub(r'<[^>]+>', '', text)
+                text = re.sub(r'&nbsp;', ' ', text)
+                text = re.sub(r'&lt;', '<', text)
+                text = re.sub(r'&gt;', '>', text)
+                text = re.sub(r'&amp;', '&', text)
+                text = re.sub(r'\n{3,}', '\n\n', text)
+                text = text.strip()
+                if len(text) > 50:  # 有效内容至少 50 字
+                    return text
+
+        # fallback: 尝试提取所有 <p> 标签内容
+        para_matches = re.findall(r'<p[^>]*>(.*?)</p>', html, re.DOTALL)
+        if para_matches:
+            paragraphs = []
+            for p in para_matches:
+                clean = re.sub(r'<[^>]+>', '', p).strip()
+                if len(clean) > 20:
+                    paragraphs.append(clean)
+            if paragraphs:
+                return '\n\n'.join(paragraphs)
+
+        return ""
+
+    def _needs_detail_fetch(self, item: dict) -> bool:
+        """判断新闻是否需要抓取详情页全文"""
+        if not self.fetch_detail:
+            return False
+        inner = item.get("data", {}).get("data", {})
+        content = inner.get("content", "")
+        content_clean = self._strip_html(content)
+        # 内容较短且包含"点击查看"
+        return len(content_clean) < 150 and "点击查看" in content_clean
+
     # ──────────────── 订阅管理 ────────────────
 
     async def _get_subscriptions(self) -> list[str]:
@@ -148,10 +243,37 @@ class Jin10NewsPlugin(Star):
         await self._save_subscriptions(sessions)
         return True
 
+    # ──────────────── 已知 ID 管理 ────────────────
+
+    async def _get_known_ids(self) -> set:
+        """获取所有已知新闻 ID 集合"""
+        raw = await self.get_kv_data(KV_KEY_KNOWN_IDS, "[]")
+        try:
+            ids = json.loads(raw) if isinstance(raw, str) else raw
+            return set(ids) if isinstance(ids, list) else set()
+        except (json.JSONDecodeError, TypeError):
+            return set()
+
+    async def _save_known_ids(self, known_ids: set):
+        """保存已知 ID（限制数量防止无限增长）"""
+        ids_list = list(known_ids)
+        if len(ids_list) > MAX_KNOWN_IDS:
+            ids_list = sorted(ids_list, reverse=True)[:MAX_KNOWN_IDS]
+        await self.put_kv_data(KV_KEY_KNOWN_IDS, json.dumps(ids_list))
+
+    async def _mark_ids_seen(self, *item_ids: str):
+        """标记 ID 为已见"""
+        known = await self._get_known_ids()
+        known.update(item_ids)
+        await self._save_known_ids(known)
+
     # ──────────────── 后台轮询 ────────────────
 
     async def _polling_loop(self):
-        """后台轮询任务：定时检查新新闻并逐条推送到订阅群组"""
+        """后台轮询任务：定时检查新新闻并逐条推送到订阅群组
+
+        使用已知 ID 集合对比，避免因 API 排序变化导致漏新闻。
+        """
         while True:
             try:
                 await asyncio.sleep(self.push_interval)
@@ -167,25 +289,31 @@ class Jin10NewsPlugin(Star):
                 if not news_list:
                     continue
 
-                last_id = await self.get_kv_data(KV_KEY_LAST_NEWS_ID, "")
+                known_ids = await self._get_known_ids()
                 new_items = []
                 for item in news_list:
                     nid = self._get_news_id(item)
-                    if nid == last_id:
-                        break
-                    new_items.append(item)
+                    if nid and nid not in known_ids:
+                        new_items.append(item)
+                        known_ids.add(nid)
 
                 if not new_items:
                     continue
 
-                # 更新最新 ID
-                await self.put_kv_data(KV_KEY_LAST_NEWS_ID, self._get_news_id(news_list[0]))
+                await self._save_known_ids(known_ids)
 
-                # 逐条推送（旧→新顺序），避免单条消息过长被平台截断
+                # 逐条推送（旧→新顺序），并抓取"点击查看"全文
                 count = len(new_items)
                 for i, item in enumerate(reversed(new_items), 1):
-                    header = f"🔔 金十数据 · 重要新闻 ({i}/{count})\n\n" if i == 1 else ""
-                    text = header + self._format_news_item(i, item)
+                    item_id = self._get_news_id(item)
+
+                    # 尝试抓取全文
+                    full = ""
+                    if self._needs_detail_fetch(item):
+                        full = await self._fetch_article_detail(item_id, item)
+
+                    header = f"🔔 金十数据 · 重要新闻 ({i}/{count})\n\n"
+                    text = header + self._format_news_item(i, item, full)
                     for umo in subscriptions:
                         try:
                             chain = MessageChain().message(text)
@@ -218,10 +346,15 @@ class Jin10NewsPlugin(Star):
             yield event.plain_result("📭 当前暂无重要新闻。")
             return
 
-        # 逐条发送，保证每条全文展示
         for i, item in enumerate(news_list, 1):
-            header = f"📢 金十数据 · 重要新闻 ({i}/{len(news_list)})\n\n" if i == 1 else ""
-            text = header + self._format_news_item(i, item)
+            item_id = self._get_news_id(item)
+            full = ""
+            if self._needs_detail_fetch(item):
+                yield event.plain_result(f"⏳ 正在获取第 {i} 条新闻全文...")
+                full = await self._fetch_article_detail(item_id, item)
+
+            header = f"📢 金十数据 · 重要新闻 ({i}/{len(news_list)})\n\n"
+            text = header + self._format_news_item(i, item, full)
             yield event.plain_result(text)
 
     @filter.command("jin10_watch")
@@ -254,16 +387,17 @@ class Jin10NewsPlugin(Star):
         """查看当前推送状态 /jin10_status"""
         subscriptions = await self._get_subscriptions()
         subscribed = event.unified_msg_origin in subscriptions
-        last_id = await self.get_kv_data(KV_KEY_LAST_NEWS_ID, "")
+        known_ids = await self._get_known_ids()
 
         lines = [
             "📊 金十新闻 · 推送状态",
             f"▪ 自动推送：{'✅ 已启用' if self.push_enabled else '❌ 已禁用'}",
             f"▪ 轮询间隔：{self.push_interval} 秒",
             f"▪ 内容长度限制：{'无限制' if self.content_max_length <= 0 else str(self.content_max_length) + ' 字'}",
+            f"▪ 抓取全文：{'✅ 已启用' if self.fetch_detail else '❌ 已禁用'}",
             f"▪ 本群订阅：{'✅ 已订阅' if subscribed else '❌ 未订阅'}",
             f"▪ 订阅总数：{len(subscriptions)} 个群",
-            f"▪ 已记录最新：{last_id[:20] + '...' if last_id else '无'}",
+            f"▪ 已跟踪新闻数：{len(known_ids)} 条",
         ]
         yield event.plain_result("\n".join(lines))
 
