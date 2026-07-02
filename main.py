@@ -6,15 +6,30 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
+import astrbot.api.message_components as Comp
 
 KV_KEY_SUBSCRIPTIONS = "push_subscriptions"
 KV_KEY_KNOWN_IDS = "known_news_ids"
-MAX_KNOWN_IDS = 500  # 最多记录多少条已推送 ID
+MAX_KNOWN_IDS = 500
 
-# "点击查看" 类新闻的详情页 URL 模板
 JIN10_DETAIL_URL = "https://flash.jin10.com/detail/{item_id}"
-# 金十详情页 API（如果存在的话，比抓 HTML 更干净）
-JIN10_DETAIL_API = "https://xnews.jin10.com/api/details/{numeric_id}"
+
+# 图片渲染 HTML 模板（Jinja2）
+NEWS_CARD_TMPL = '''
+<div style="width:620px; padding:24px 28px; background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%); font-family:'PingFang SC','Microsoft YaHei',sans-serif;">
+  <div style="display:flex;align-items:center;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid rgba(255,255,255,0.1);">
+    <span style="background:#e74c3c;color:#fff;font-size:12px;padding:3px 10px;border-radius:3px;font-weight:bold;">金十数据</span>
+    <span style="color:#888;font-size:12px;margin-left:10px;">{{ index_tag }}</span>
+  </div>
+  <h2 style="color:#f0f0f0;font-size:22px;line-height:1.4;margin:0 0 10px 0;">{{ title }}</h2>
+  <div style="color:#999;font-size:13px;margin-bottom:18px;">🕐 {{ time }}</div>
+  <div style="color:#d0d0d0;font-size:15px;line-height:1.9;word-break:break-all;">{{ content }}</div>
+  {% for img in images %}
+  <img src="{{ img }}" style="max-width:100%;margin-top:16px;border-radius:8px;" />
+  {% endfor %}
+  <div style="margin-top:20px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.06);color:#666;font-size:11px;">— 金十新闻自动推送 —</div>
+</div>
+'''
 
 
 class Jin10NewsPlugin(Star):
@@ -22,9 +37,9 @@ class Jin10NewsPlugin(Star):
 
     通过 /jin10 指令获取金十数据的重要新闻快讯。
     支持 /jin10_watch 订阅群组自动推送新新闻。
-    自动抓取"点击查看"类新闻的全文内容。
+    自动抓取"点击查看"类新闻的全文内容和图片。
+    支持文字/图片渲染两种输出模式。
     适配企业微信、QQ、Telegram 等所有 AstrBot 支持平台。
-    数据来源：https://topic17z2k407.jin10.com/topic/jin10_important_news.html
     """
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -39,35 +54,32 @@ class Jin10NewsPlugin(Star):
         self.push_interval = config.get("push_interval", 60)
         self.content_max_length = config.get("content_max_length", 0)
         self.fetch_detail = config.get("fetch_detail", True)
+        self.output_mode = config.get("output_mode", "text")
+        self.show_images = config.get("show_images", True)
         self._poll_task: asyncio.Task | None = None
 
     async def initialize(self):
-        """插件初始化时启动后台轮询任务"""
         logger.info("金十重要新闻插件已加载")
         if self.push_enabled:
             self._poll_task = asyncio.create_task(self._polling_loop())
-            logger.info(f"金十新闻自动推送已启动，轮询间隔 {self.push_interval}s")
+            logger.info(f"金十新闻自动推送已启动，轮询间隔 {self.push_interval}s, 输出模式={self.output_mode}")
 
     # ──────────────── 工具方法 ────────────────
 
     @staticmethod
     def _strip_html(text: str) -> str:
-        """去除 HTML 标签，<br/> 转为换行"""
         text = re.sub(r'<br\s*/?>', '\n', text)
         text = re.sub(r'<[^>]+>', '', text)
         text = text.replace('&nbsp;', ' ')
         return text.strip()
 
-    def _format_news_item(self, index: int, item: dict, full_content: str = "") -> str:
-        """格式化单条新闻"""
+    def _build_news_data(self, item: dict, full_content: str = "") -> dict:
+        """从 item 中提取标题、时间、内容等结构化数据"""
         data = item.get("data", {})
         time_str = data.get("time", "未知时间")
         inner = data.get("data", {})
-        title = inner.get("title", "")
-        content = inner.get("content", "")
-
-        title = self._strip_html(title)
-        content = self._strip_html(content)
+        title = self._strip_html(inner.get("title", ""))
+        content = self._strip_html(inner.get("content", ""))
 
         if not title and content:
             match = re.match(r'【(.+?)】', content)
@@ -75,21 +87,28 @@ class Jin10NewsPlugin(Star):
                 title = match.group(1)
                 content = content[content.index('】') + 1:].strip()
 
-        # 如果有抓取到的全文，使用全文替代摘要
         if full_content:
             content = full_content
 
-        lines = [f"📰 #{index} {title}" if title else f"📰 #{index}"]
-        lines.append(f"🕐 {time_str}")
-        if content:
-            limit = self.content_max_length
-            if limit > 0 and len(content) > limit:
-                content = content[:limit] + "……"
-            lines.append(content)
-        return "\n".join(lines)
+        limit = self.content_max_length
+        if limit > 0 and len(content) > limit:
+            content = content[:limit] + "……"
+
+        return {"title": title, "time": time_str, "content": content}
+
+    def _get_api_images(self, item: dict) -> list[str]:
+        """从 API 数据中提取图片 URL"""
+        images = []
+        try:
+            inner = item.get("data", {}).get("data", {})
+            pic = inner.get("pic", "")
+            if pic and pic.startswith("http"):
+                images.append(pic)
+        except Exception:
+            pass
+        return images
 
     async def _fetch_news_api(self) -> dict | None:
-        """调用 Jin10 API 获取新闻数据，返回 JSON 或 None"""
         url = f"{self.api_base_url}?time_type=time&sort=priority"
         headers = {
             "x-version": self.x_version,
@@ -113,19 +132,14 @@ class Jin10NewsPlugin(Star):
             return None
 
     def _get_news_id(self, item: dict) -> str:
-        """从新闻条目中提取唯一标识"""
         return item.get("item_id", "") or item.get("data", {}).get("id", "")
 
     # ──────────────── 详情页抓取 ────────────────
 
-    async def _fetch_article_detail(self, item_id: str, item: dict) -> str:
-        """抓取"点击查看"类新闻的全文内容
-
-        通过 flash.jin10.com/detail/{item_id} 获取详情页，
-        提取正文段落。失败时返回空字符串。
-        """
+    async def _fetch_article_detail(self, item_id: str) -> tuple[str, list[str]]:
+        """抓取详情页，返回 (全文文本, 图片URL列表)"""
         if not self.fetch_detail:
-            return ""
+            return "", []
 
         url = JIN10_DETAIL_URL.format(item_id=item_id)
         headers = {
@@ -134,87 +148,155 @@ class Jin10NewsPlugin(Star):
         }
         try:
             async with aiohttp.ClientSession() as session:
-                # allow_redirects=True 自动跟随 302 跳转
                 async with session.get(url, headers=headers,
                                        timeout=aiohttp.ClientTimeout(total=10),
                                        allow_redirects=True) as resp:
                     if resp.status != 200:
-                        logger.warning(f"抓取详情页失败 {url}: HTTP {resp.status}")
-                        return ""
+                        return "", []
                     html = await resp.text()
 
-            # 从 HTML 中提取正文段落
-            content = self._extract_article_text(html)
-            if content:
-                logger.info(f"成功抓取详情全文 {item_id}: {len(content)} 字")
-            return content
+            text, images = self._extract_article_content(html)
+            if text:
+                logger.info(f"抓取详情 {item_id}: {len(text)} 字, {len(images)} 图")
+            return text, images
 
         except asyncio.TimeoutError:
             logger.warning(f"抓取详情页超时 {item_id}")
-            return ""
         except Exception as e:
             logger.warning(f"抓取详情页异常 {item_id}: {e}")
-            return ""
+        return "", []
 
     @staticmethod
-    def _extract_article_text(html: str) -> str:
-        """从 xnews.jin10.com 详情页 HTML 中提取正文纯文本"""
-        # 尝试匹配 <div class="content">...</div> 或 <article>...</article>
-        # 金十 xnews 页面正文通常在 <div class="details-content"> 或类似结构中
+    def _extract_article_content(html: str) -> tuple[str, list[str]]:
+        """从详情页 HTML 提取正文和图片"""
+        text = ""
+        images = []
+
+        # 正文提取
         patterns = [
             r'<div[^>]*class="[^"]*details-content[^"]*"[^>]*>(.*?)</div>',
             r'<div[^>]*class="[^"]*article-content[^"]*"[^>]*>(.*?)</div>',
             r'<div[^>]*class="[^"]*content\s+detail[^"]*"[^>]*>(.*?)</div>',
             r'<article[^>]*>(.*?)</article>',
         ]
-
         for pattern in patterns:
             match = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
             if match:
-                text = match.group(1)
-                # 清理 HTML 标签
-                text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL)
-                text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
-                text = re.sub(r'<br\s*/?>', '\n', text)
-                text = re.sub(r'</?p[^>]*>', '\n', text)
-                text = re.sub(r'</?div[^>]*>', '\n', text)
-                text = re.sub(r'<[^>]+>', '', text)
-                text = re.sub(r'&nbsp;', ' ', text)
-                text = re.sub(r'&lt;', '<', text)
-                text = re.sub(r'&gt;', '>', text)
-                text = re.sub(r'&amp;', '&', text)
-                text = re.sub(r'\n{3,}', '\n\n', text)
-                text = text.strip()
-                if len(text) > 50:  # 有效内容至少 50 字
-                    return text
+                raw = match.group(1)
+                # 提取图片
+                imgs = re.findall(r'<img[^>]+src="([^"]+)"', raw, re.IGNORECASE)
+                images.extend(imgs)
+                # 清理文本
+                raw = re.sub(r'<script[^>]*>.*?</script>', '', raw, flags=re.DOTALL)
+                raw = re.sub(r'<style[^>]*>.*?</style>', '', raw, flags=re.DOTALL)
+                raw = re.sub(r'<br\s*/?>', '\n', raw)
+                raw = re.sub(r'</?p[^>]*>', '\n', raw)
+                raw = re.sub(r'</?div[^>]*>', '\n', raw)
+                raw = re.sub(r'<[^>]+>', '', raw)
+                raw = re.sub(r'&nbsp;', ' ', raw)
+                raw = re.sub(r'&lt;', '<', raw)
+                raw = re.sub(r'&gt;', '>', raw)
+                raw = re.sub(r'&amp;', '&', raw)
+                raw = re.sub(r'\n{3,}', '\n\n', raw)
+                text = raw.strip()
+                if len(text) > 50:
+                    break
 
-        # fallback: 尝试提取所有 <p> 标签内容
-        para_matches = re.findall(r'<p[^>]*>(.*?)</p>', html, re.DOTALL)
-        if para_matches:
-            paragraphs = []
-            for p in para_matches:
-                clean = re.sub(r'<[^>]+>', '', p).strip()
-                if len(clean) > 20:
-                    paragraphs.append(clean)
-            if paragraphs:
-                return '\n\n'.join(paragraphs)
+        # fallback: <p> 标签提取
+        if not text:
+            para_matches = re.findall(r'<p[^>]*>(.*?)</p>', html, re.DOTALL)
+            if para_matches:
+                paragraphs = []
+                for p in para_matches:
+                    clean = re.sub(r'<[^>]+>', '', p).strip()
+                    if len(clean) > 20:
+                        paragraphs.append(clean)
+                if paragraphs:
+                    text = '\n\n'.join(paragraphs)
 
-        return ""
+        # 全局图片提取（如果上面没提到）
+        if not images:
+            all_imgs = re.findall(r'<img[^>]+src="([^"]+)"', html, re.IGNORECASE)
+            # 过滤掉头像、图标等小图
+            for img in all_imgs:
+                if any(k in img.lower() for k in ['avatar', 'icon', 'logo', 'emoji', 'svg', '1x1', 'pixel']):
+                    continue
+                if img.startswith('http'):
+                    images.append(img)
+
+        # 去重
+        seen = set()
+        unique_images = []
+        for img in images:
+            if img not in seen:
+                seen.add(img)
+                unique_images.append(img)
+
+        return text, unique_images
 
     def _needs_detail_fetch(self, item: dict) -> bool:
-        """判断新闻是否需要抓取详情页全文"""
         if not self.fetch_detail:
             return False
         inner = item.get("data", {}).get("data", {})
-        content = inner.get("content", "")
-        content_clean = self._strip_html(content)
-        # 内容较短且包含"点击查看"
-        return len(content_clean) < 150 and "点击查看" in content_clean
+        content = self._strip_html(inner.get("content", ""))
+        return len(content) < 150 and "点击查看" in content
+
+    # ──────────────── 发送逻辑 ────────────────
+
+    async def _send_news(self, umo: str, index: int, count: int, news_data: dict,
+                         images: list[str], is_push: bool):
+        """发送单条新闻到指定会话（支持文字/图片两种模式）"""
+        tag = f"🔔 金十数据 · 重要新闻 ({index}/{count})" if is_push else \
+              f"📢 金十数据 · 重要新闻 ({index}/{count})"
+
+        if self.output_mode == "image":
+            # ── 图片渲染模式 ──
+            try:
+                render_data = {
+                    "index_tag": tag,
+                    "title": news_data["title"] or "重要新闻",
+                    "time": news_data["time"],
+                    "content": news_data["content"],
+                    "images": images if self.show_images else [],
+                }
+                img_url = await self.html_render(NEWS_CARD_TMPL, render_data,
+                                                 options={"type": "jpeg", "quality": 90})
+                chain = MessageChain().message("").image(img_url)
+                await self.context.send_message(umo, chain)
+            except Exception as e:
+                logger.error(f"图片渲染失败，回退文字模式: {e}")
+                await self._send_news_text(umo, tag, news_data, images)
+        else:
+            # ── 文字模式 ──
+            await self._send_news_text(umo, tag, news_data, images)
+
+    async def _send_news_text(self, umo: str, tag: str, news_data: dict, images: list[str]):
+        """文字模式发送：文字消息 + 可选图片"""
+        lines = [tag, ""]
+        if news_data["title"]:
+            lines.append(f"📰 {news_data['title']}")
+        lines.append(f"🕐 {news_data['time']}")
+        if news_data["content"]:
+            lines.append("")
+            lines.append(news_data["content"])
+
+        text = "\n".join(lines)
+        chain = MessageChain().message(text)
+        await self.context.send_message(umo, chain)
+
+        # 发送图片（文字模式下单独发图）
+        if self.show_images and images:
+            for img_url in images[:3]:  # 最多3张
+                try:
+                    img_chain = MessageChain().message("").image(img_url)
+                    await self.context.send_message(umo, img_chain)
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.warning(f"发送图片失败 {img_url[:60]}: {e}")
 
     # ──────────────── 订阅管理 ────────────────
 
     async def _get_subscriptions(self) -> list[str]:
-        """获取所有订阅会话"""
         raw = await self.get_kv_data(KV_KEY_SUBSCRIPTIONS, "[]")
         try:
             return json.loads(raw) if isinstance(raw, str) else raw
@@ -222,11 +304,9 @@ class Jin10NewsPlugin(Star):
             return []
 
     async def _save_subscriptions(self, sessions: list[str]):
-        """保存订阅会话"""
         await self.put_kv_data(KV_KEY_SUBSCRIPTIONS, json.dumps(sessions, ensure_ascii=False))
 
     async def _add_subscription(self, umo: str) -> bool:
-        """添加订阅，返回是否新增"""
         sessions = await self._get_subscriptions()
         if umo in sessions:
             return False
@@ -235,7 +315,6 @@ class Jin10NewsPlugin(Star):
         return True
 
     async def _remove_subscription(self, umo: str) -> bool:
-        """移除订阅，返回是否移除"""
         sessions = await self._get_subscriptions()
         if umo not in sessions:
             return False
@@ -246,7 +325,6 @@ class Jin10NewsPlugin(Star):
     # ──────────────── 已知 ID 管理 ────────────────
 
     async def _get_known_ids(self) -> set:
-        """获取所有已知新闻 ID 集合"""
         raw = await self.get_kv_data(KV_KEY_KNOWN_IDS, "[]")
         try:
             ids = json.loads(raw) if isinstance(raw, str) else raw
@@ -255,25 +333,14 @@ class Jin10NewsPlugin(Star):
             return set()
 
     async def _save_known_ids(self, known_ids: set):
-        """保存已知 ID（限制数量防止无限增长）"""
         ids_list = list(known_ids)
         if len(ids_list) > MAX_KNOWN_IDS:
             ids_list = sorted(ids_list, reverse=True)[:MAX_KNOWN_IDS]
         await self.put_kv_data(KV_KEY_KNOWN_IDS, json.dumps(ids_list))
 
-    async def _mark_ids_seen(self, *item_ids: str):
-        """标记 ID 为已见"""
-        known = await self._get_known_ids()
-        known.update(item_ids)
-        await self._save_known_ids(known)
-
     # ──────────────── 后台轮询 ────────────────
 
     async def _polling_loop(self):
-        """后台轮询任务：定时检查新新闻并逐条推送到订阅群组
-
-        使用已知 ID 集合对比，避免因 API 排序变化导致漏新闻。
-        """
         while True:
             try:
                 await asyncio.sleep(self.push_interval)
@@ -302,24 +369,19 @@ class Jin10NewsPlugin(Star):
 
                 await self._save_known_ids(known_ids)
 
-                # 逐条推送（旧→新顺序），并抓取"点击查看"全文
                 count = len(new_items)
                 for i, item in enumerate(reversed(new_items), 1):
                     item_id = self._get_news_id(item)
+                    images = list(self._get_api_images(item))
 
-                    # 尝试抓取全文
-                    full = ""
+                    full_text = ""
                     if self._needs_detail_fetch(item):
-                        full = await self._fetch_article_detail(item_id, item)
+                        full_text, detail_images = await self._fetch_article_detail(item_id)
+                        images.extend(detail_images)
 
-                    header = f"🔔 金十数据 · 重要新闻 ({i}/{count})\n\n"
-                    text = header + self._format_news_item(i, item, full)
+                    news_data = self._build_news_data(item, full_text)
                     for umo in subscriptions:
-                        try:
-                            chain = MessageChain().message(text)
-                            await self.context.send_message(umo, chain)
-                        except Exception as e:
-                            logger.error(f"推送消息到 {umo[:30]}... 失败: {e}")
+                        await self._send_news(umo, i, count, news_data, images, is_push=True)
 
             except asyncio.CancelledError:
                 logger.info("金十新闻后台轮询任务已取消")
@@ -331,7 +393,6 @@ class Jin10NewsPlugin(Star):
 
     @filter.command("jin10")
     async def fetch_news(self, event: AstrMessageEvent, count: int = 0):
-        """获取金十数据重要新闻 /jin10 [数量]"""
         if count <= 0:
             count = self.default_count
         count = min(count, self.max_count)
@@ -346,24 +407,25 @@ class Jin10NewsPlugin(Star):
             yield event.plain_result("📭 当前暂无重要新闻。")
             return
 
+        umo = event.unified_msg_origin
         for i, item in enumerate(news_list, 1):
             item_id = self._get_news_id(item)
-            full = ""
-            if self._needs_detail_fetch(item):
-                yield event.plain_result(f"⏳ 正在获取第 {i} 条新闻全文...")
-                full = await self._fetch_article_detail(item_id, item)
+            images = list(self._get_api_images(item))
 
-            header = f"📢 金十数据 · 重要新闻 ({i}/{len(news_list)})\n\n"
-            text = header + self._format_news_item(i, item, full)
-            yield event.plain_result(text)
+            full_text = ""
+            if self._needs_detail_fetch(item):
+                yield event.plain_result(f"⏳ 正在获取第 {i} 条新闻全文及图片...")
+                full_text, detail_images = await self._fetch_article_detail(item_id)
+                images.extend(detail_images)
+
+            news_data = self._build_news_data(item, full_text)
+            await self._send_news(umo, i, len(news_list), news_data, images, is_push=False)
 
     @filter.command("jin10_watch")
     async def watch_news(self, event: AstrMessageEvent):
-        """订阅当前群组，自动推送新新闻 /jin10_watch"""
         if not self.push_enabled:
             yield event.plain_result("⚠️ 自动推送功能未启用，请在插件配置中开启 push_enabled。")
             return
-
         umo = event.unified_msg_origin
         added = await self._add_subscription(umo)
         if added:
@@ -374,7 +436,6 @@ class Jin10NewsPlugin(Star):
 
     @filter.command("jin10_unwatch")
     async def unwatch_news(self, event: AstrMessageEvent):
-        """取消当前群组的新闻推送 /jin10_unwatch"""
         umo = event.unified_msg_origin
         removed = await self._remove_subscription(umo)
         if removed:
@@ -384,7 +445,6 @@ class Jin10NewsPlugin(Star):
 
     @filter.command("jin10_status")
     async def status_news(self, event: AstrMessageEvent):
-        """查看当前推送状态 /jin10_status"""
         subscriptions = await self._get_subscriptions()
         subscribed = event.unified_msg_origin in subscriptions
         known_ids = await self._get_known_ids()
@@ -393,7 +453,9 @@ class Jin10NewsPlugin(Star):
             "📊 金十新闻 · 推送状态",
             f"▪ 自动推送：{'✅ 已启用' if self.push_enabled else '❌ 已禁用'}",
             f"▪ 轮询间隔：{self.push_interval} 秒",
-            f"▪ 内容长度限制：{'无限制' if self.content_max_length <= 0 else str(self.content_max_length) + ' 字'}",
+            f"▪ 输出模式：{'🖼️ 图片渲染' if self.output_mode == 'image' else '📝 文字'}",
+            f"▪ 文章图片：{'✅ 显示' if self.show_images else '❌ 隐藏'}",
+            f"▪ 内容截断：{'无限制' if self.content_max_length <= 0 else str(self.content_max_length) + ' 字'}",
             f"▪ 抓取全文：{'✅ 已启用' if self.fetch_detail else '❌ 已禁用'}",
             f"▪ 本群订阅：{'✅ 已订阅' if subscribed else '❌ 未订阅'}",
             f"▪ 订阅总数：{len(subscriptions)} 个群",
@@ -402,7 +464,6 @@ class Jin10NewsPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
-        """插件卸载时调用"""
         if self._poll_task:
             self._poll_task.cancel()
         logger.info("金十重要新闻插件已卸载")

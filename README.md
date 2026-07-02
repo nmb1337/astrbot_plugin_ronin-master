@@ -14,6 +14,8 @@
 - **`/jin10_unwatch`** — 取消当前群组的自动推送
 - **`/jin10_status`** — 查看当前推送状态
 - 自动解析新闻标题与正文（支持 `【标题】` 格式）
+- 支持 **文字/图片渲染** 两种输出模式
+- 自动提取文章内图片并发送
 - 默认不截断，展示完整新闻内容
 
 ## 📦 安装
@@ -48,9 +50,15 @@ pip install -r requirements.txt
 | `push_enabled` | 是否启用自动推送 | `true` |
 | `push_interval` | 推送轮询间隔（秒） | `60` |
 | `content_max_length` | 内容最大长度（0=不限制） | `0` |
-| `fetch_detail` | 自动抓取"点击查看"全文 | `true` |
+| `fetch_detail` | 自动抓取"点击查看"全文及图片 | `true` |
+| `output_mode` | 输出模式（`text`/`image`） | `text` |
+| `show_images` | 显示文章中图片 | `true` |
 
 一般无需修改，保持默认即可。
+
+### 🖼️ 图片渲染模式
+
+将 `output_mode` 设为 `image` 后，新闻会以精美图片卡片形式发送（深色主题、标题醒目），文章内图片也会嵌入卡片中。
 
 ## 🔔 自动推送
 

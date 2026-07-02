@@ -51,6 +51,19 @@
     "description": "自动抓取“点击查看”全文",
     "type": "bool",
     "default": true,
-    "hint": "开启后，遇到仅有摘要+点击查看的新闻，会自动抓取详情页的完整文章内容。"
+    "hint": "开启后，遇到仅有摘要+点击查看的新闻，会自动抓取详情页的完整文章内容和图片。"
+  },
+  "output_mode": {
+    "description": "新闻输出模式",
+    "type": "string",
+    "default": "text",
+    "options": ["text", "image"],
+    "hint": "text：纯文字输出；image：渲染为精美图片卡片发送。"
+  },
+  "show_images": {
+    "description": "显示文章中图片",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，会自动提取文章中的图片并发送（文字模式单独发图，图片模式嵌入卡片中）。"
   }
 }
