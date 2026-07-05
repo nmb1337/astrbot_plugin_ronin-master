@@ -1,6 +1,8 @@
 import re
 import asyncio
 import json
+import os
+import tempfile
 import aiohttp
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star
@@ -68,6 +70,8 @@ class Jin10NewsPlugin(Star):
 
     @staticmethod
     def _strip_html(text: str) -> str:
+        if not text or not isinstance(text, str):
+            return ""
         text = re.sub(r'<br\s*/?>', '\n', text)
         text = re.sub(r'<[^>]+>', '', text)
         text = text.replace('&nbsp;', ' ')
@@ -75,11 +79,11 @@ class Jin10NewsPlugin(Star):
 
     def _build_news_data(self, item: dict, full_content: str = "") -> dict:
         """从 item 中提取标题、时间、内容等结构化数据"""
-        data = item.get("data", {})
-        time_str = data.get("time", "未知时间")
-        inner = data.get("data", {})
-        title = self._strip_html(inner.get("title", ""))
-        content = self._strip_html(inner.get("content", ""))
+        data = item.get("data", {}) or {}
+        time_str = data.get("time") or "未知时间"
+        inner = data.get("data") or {}
+        title = self._strip_html(inner.get("title") or "")
+        content = self._strip_html(inner.get("content") or "")
 
         if not title and content:
             match = re.match(r'【(.+?)】', content)
@@ -100,9 +104,9 @@ class Jin10NewsPlugin(Star):
         """从 API 数据中提取图片 URL"""
         images = []
         try:
-            inner = item.get("data", {}).get("data", {})
-            pic = inner.get("pic", "")
-            if pic and pic.startswith("http"):
+            inner = (item.get("data") or {}).get("data") or {}
+            pic = inner.get("pic") or ""
+            if pic and isinstance(pic, str) and pic.startswith("http"):
                 images.append(pic)
         except Exception:
             pass
@@ -237,9 +241,59 @@ class Jin10NewsPlugin(Star):
     def _needs_detail_fetch(self, item: dict) -> bool:
         if not self.fetch_detail:
             return False
-        inner = item.get("data", {}).get("data", {})
-        content = self._strip_html(inner.get("content", ""))
-        return len(content) < 150 and "点击查看" in content
+        try:
+            inner = item.get("data", {}).get("data", {}) or {}
+            content = self._strip_html(inner.get("content") or "")
+            return len(content) < 150 and "点击查看" in content
+        except Exception:
+            return False
+
+    # ──────────────── 发送逻辑 ────────────────
+
+    # ──────────────── 图片下载与发送 ────────────────
+
+    async def _download_image(self, url: str) -> str | None:
+        """下载图片到临时文件，返回本地路径"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.read()
+            # 推断扩展名
+            ext = ".jpg"
+            url_lower = url.split("?")[0].lower()
+            if ".png" in url_lower:
+                ext = ".png"
+            elif ".gif" in url_lower:
+                ext = ".gif"
+            elif ".webp" in url_lower:
+                ext = ".webp"
+            tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+            tmp.write(data)
+            tmp.close()
+            return tmp.name
+        except Exception as e:
+            logger.warning(f"下载图片失败 {url[:60]}: {e}")
+            return None
+
+    async def _send_image_to(self, umo: str, img_url: str) -> bool:
+        """下载并发送单张图片，返回是否成功"""
+        local_path = await self._download_image(img_url)
+        if not local_path:
+            return False
+        try:
+            chain = MessageChain().file_image(local_path)
+            await self.context.send_message(umo, chain)
+            return True
+        except Exception as e:
+            logger.warning(f"发送图片失败 {img_url[:60]}: {e}")
+            return False
+        finally:
+            try:
+                os.unlink(local_path)
+            except OSError:
+                pass
 
     # ──────────────── 发送逻辑 ────────────────
 
@@ -261,8 +315,7 @@ class Jin10NewsPlugin(Star):
                 }
                 img_url = await self.html_render(NEWS_CARD_TMPL, render_data,
                                                  options={"type": "jpeg", "quality": 90})
-                chain = [Comp.Image.fromURL(img_url)]
-                await self.context.send_message(umo, chain)
+                await self._send_image_to(umo, img_url)
             except Exception as e:
                 logger.error(f"图片渲染失败，回退文字模式: {e}")
                 await self._send_news_text(umo, tag, news_data, images)
@@ -287,12 +340,8 @@ class Jin10NewsPlugin(Star):
         # 发送图片（文字模式下单独发图）
         if self.show_images and images:
             for img_url in images[:3]:  # 最多3张
-                try:
-                    img_chain = [Comp.Image.fromURL(img_url)]
-                    await self.context.send_message(umo, img_chain)
-                    await asyncio.sleep(0.3)
-                except Exception as e:
-                    logger.warning(f"发送图片失败 {img_url[:60]}: {e}")
+                await self._send_image_to(umo, img_url)
+                await asyncio.sleep(0.3)
 
     # ──────────────── 订阅管理 ────────────────
 
