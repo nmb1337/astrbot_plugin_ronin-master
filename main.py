@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import aiohttp
+from PIL import Image, ImageDraw, ImageFont
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star
 from astrbot.api import logger
@@ -16,22 +17,176 @@ MAX_KNOWN_IDS = 500
 
 JIN10_DETAIL_URL = "https://flash.jin10.com/detail/{item_id}"
 
-# 图片渲染 HTML 模板（Jinja2）
-NEWS_CARD_TMPL = '''
-<div style="width:620px; padding:24px 28px; background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%); font-family:'PingFang SC','Microsoft YaHei',sans-serif;">
-  <div style="display:flex;align-items:center;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid rgba(255,255,255,0.1);">
-    <span style="background:#e74c3c;color:#fff;font-size:12px;padding:3px 10px;border-radius:3px;font-weight:bold;">金十数据</span>
-    <span style="color:#888;font-size:12px;margin-left:10px;">{{ index_tag }}</span>
-  </div>
-  <h2 style="color:#f0f0f0;font-size:22px;line-height:1.4;margin:0 0 10px 0;">{{ title }}</h2>
-  <div style="color:#999;font-size:13px;margin-bottom:18px;">🕐 {{ time }}</div>
-  <div style="color:#d0d0d0;font-size:15px;line-height:1.9;word-break:break-all;">{{ content }}</div>
-  {% for img in images %}
-  <img src="{{ img }}" style="max-width:100%;margin-top:16px;border-radius:8px;" />
-  {% endfor %}
-  <div style="margin-top:20px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.06);color:#666;font-size:11px;">— 金十新闻自动推送 —</div>
-</div>
-'''
+# ──────────────── Pillow 本地图片渲染 ────────────────
+
+def _find_chinese_font() -> str | None:
+    """查找系统中可用的中文字体"""
+    candidates = [
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/msyhbd.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/simsun.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont,
+               max_width: int) -> list[str]:
+    """将文本按像素宽度换行"""
+    lines = []
+    for paragraph in text.split('\n'):
+        if not paragraph.strip():
+            lines.append('')
+            continue
+        current = ""
+        for ch in paragraph:
+            test = current + ch
+            bbox = draw.textbbox((0, 0), test, font=font)
+            if bbox[2] - bbox[0] > max_width and current:
+                lines.append(current)
+                current = ch
+            else:
+                current = test
+        if current:
+            lines.append(current)
+    return lines
+
+def _render_news_card_sync(tag: str, title: str, time_str: str,
+                           content: str, image_paths: list[str]) -> str:
+    """使用 Pillow 本地渲染新闻卡片图片，返回临时文件路径"""
+    W = 640
+    PAD = 28
+    CW = W - 2 * PAD  # content width
+    BG = (26, 26, 46)          # #1a1a2e
+    CARD_BG = (22, 33, 62)     # #16213e
+    RED = (231, 76, 60)        # #e74c3c
+    WHITE = (240, 240, 240)
+    GRAY = (153, 153, 153)
+    LIGHT_GRAY = (208, 208, 208)
+    DARK_GRAY = (102, 102, 102)
+    LINE_COLOR = (255, 255, 255, 25)
+
+    font_path = _find_chinese_font()
+    try:
+        ft_title = ImageFont.truetype(font_path, 22) if font_path else ImageFont.load_default()
+        ft_body = ImageFont.truetype(font_path, 15) if font_path else ImageFont.load_default()
+        ft_time = ImageFont.truetype(font_path, 13) if font_path else ImageFont.load_default()
+        ft_tag = ImageFont.truetype(font_path, 12) if font_path else ImageFont.load_default()
+        ft_footer = ImageFont.truetype(font_path, 11) if font_path else ImageFont.load_default()
+    except Exception:
+        ft_title = ft_body = ft_time = ft_tag = ft_footer = ImageFont.load_default()
+
+    # 准备绘制用的 ImageDraw（用于测量）
+    dummy = Image.new('RGB', (W, 100))
+    d_draw = ImageDraw.Draw(dummy)
+
+    # 标题换行
+    title_lines = _wrap_text(d_draw, title, ft_title, CW)
+    # 正文换行
+    body_lines = _wrap_text(d_draw, content, ft_body, CW)
+
+    # 计算总高度
+    line_h_title = ft_title.size + 6 if hasattr(ft_title, 'size') else 28
+    line_h_body = ft_body.size + 6 if hasattr(ft_body, 'size') else 24
+
+    h = 0
+    h += PAD  # top padding
+    # tag bar
+    h += 24 + 16  # tag height + gap
+    # title
+    h += len(title_lines) * line_h_title + 12
+    # time
+    h += line_h_body + 18
+    # body
+    h += len(body_lines) * line_h_body + 20
+    # footer
+    h += 14 + PAD
+
+    # 图片预留高度（每张图 max 300px 高）
+    img_region_h = 0
+    for img_path in image_paths:
+        try:
+            im = Image.open(img_path)
+            iw, ih = im.size
+            scale = min(CW / iw, 300 / ih, 1.0) if iw > 0 else 1.0
+            img_region_h += int(ih * scale) + 16
+            im.close()
+        except Exception:
+            pass
+    h += img_region_h
+
+    # 创建画布
+    img = Image.new('RGB', (W, max(h, 200)), BG)
+    draw = ImageDraw.Draw(img)
+
+    y = PAD
+
+    # ── 顶部分隔线 ──
+    draw.line([(0, 0), (W, 0)], fill=RED, width=3)
+
+    # ── 标签栏 ──
+    tag_text = "金十数据"
+    tag_bbox = draw.textbbox((0, 0), tag_text, font=ft_tag)
+    tag_w = tag_bbox[2] - tag_bbox[0] + 20
+    tag_h = tag_bbox[3] - tag_bbox[1] + 8
+    draw.rounded_rectangle([(PAD, y), (PAD + tag_w, y + tag_h)], radius=4, fill=RED)
+    draw.text((PAD + 10, y + 4), tag_text, fill=(255, 255, 255), font=ft_tag)
+    # index tag
+    idx_bbox = draw.textbbox((0, 0), tag, font=ft_tag)
+    draw.text((PAD + tag_w + 12, y + 5), tag, fill=GRAY, font=ft_tag)
+    y += tag_h + 16
+
+    # ── 分隔线 ──
+    draw.line([(PAD, y - 4), (W - PAD, y - 4)], fill=LINE_COLOR, width=1)
+
+    # ── 标题 ──
+    for line in title_lines:
+        draw.text((PAD, y), line, fill=WHITE, font=ft_title)
+        y += line_h_title
+    y += 12
+
+    # ── 时间 ──
+    time_label = f"🕐 {time_str}"
+    draw.text((PAD, y), time_label, fill=GRAY, font=ft_time)
+    y += line_h_body + 18
+
+    # ── 正文 ──
+    for line in body_lines:
+        draw.text((PAD, y), line, fill=LIGHT_GRAY, font=ft_body)
+        y += line_h_body
+    y += 20
+
+    # ── 图片 ──
+    for img_path in image_paths:
+        try:
+            im = Image.open(img_path).convert('RGB')
+            iw, ih = im.size
+            scale = min(CW / iw, 300 / ih, 1.0) if iw > 0 else 1.0
+            new_w, new_h = int(iw * scale), int(ih * scale)
+            im = im.resize((new_w, new_h), Image.LANCZOS)
+            img.paste(im, (PAD, y))
+            im.close()
+            y += new_h + 16
+        except Exception:
+            pass
+
+    # ── 底部分隔线 ──
+    draw.line([(PAD, y - 8), (W - PAD, y - 8)], fill=LINE_COLOR, width=1)
+
+    # ── 页脚 ──
+    footer_text = "— 金十新闻自动推送 —"
+    draw.text((PAD, y), footer_text, fill=DARK_GRAY, font=ft_footer)
+
+    # 保存到临时文件
+    tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+    img.save(tmp, format='PNG')
+    tmp.close()
+    return tmp.name
 
 
 class Jin10NewsPlugin(Star):
@@ -295,6 +450,35 @@ class Jin10NewsPlugin(Star):
             except OSError:
                 pass
 
+    # ──────────────── 图片渲染 ────────────────
+
+    async def _render_news_card(self, tag: str, title: str, time_str: str,
+                                 content: str, image_urls: list[str]) -> str | None:
+        """异步渲染新闻卡片：先下载图片，再调用 Pillow 渲染"""
+        # 下载文中图片到本地
+        local_paths = []
+        for url in image_urls[:5]:
+            path = await self._download_image(url)
+            if path:
+                local_paths.append(path)
+
+        try:
+            loop = asyncio.get_running_loop()
+            card_path = await loop.run_in_executor(
+                None, _render_news_card_sync, tag, title, time_str, content, local_paths
+            )
+            return card_path
+        except Exception as e:
+            logger.error(f"Pillow 渲染失败: {e}")
+            return None
+        finally:
+            # 清理下载的临时图片
+            for p in local_paths:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
     # ──────────────── 发送逻辑 ────────────────
 
     async def _send_news(self, umo: str, index: int, count: int, news_data: dict,
@@ -302,23 +486,29 @@ class Jin10NewsPlugin(Star):
         """发送单条新闻到指定会话（支持文字/图片两种模式）"""
         tag = f"🔔 金十数据 · 重要新闻 ({index}/{count})" if is_push else \
               f"📢 金十数据 · 重要新闻 ({index}/{count})"
+        title = news_data["title"] or "重要新闻"
+        time_str = news_data["time"]
+        content = news_data["content"]
+        show_imgs = images if self.show_images else []
 
         if self.output_mode == "image":
-            # ── 图片渲染模式 ──
-            try:
-                render_data = {
-                    "index_tag": tag,
-                    "title": news_data["title"] or "重要新闻",
-                    "time": news_data["time"],
-                    "content": news_data["content"],
-                    "images": images if self.show_images else [],
-                }
-                img_url = await self.html_render(NEWS_CARD_TMPL, render_data,
-                                                 options={"type": "jpeg", "quality": 90})
-                await self._send_image_to(umo, img_url)
-            except Exception as e:
-                logger.error(f"图片渲染失败，回退文字模式: {e}")
-                await self._send_news_text(umo, tag, news_data, images)
+            # ── 图片渲染模式：本地 Pillow 渲染 ──
+            card_path = await self._render_news_card(tag, title, time_str, content, show_imgs)
+            if card_path:
+                try:
+                    chain = MessageChain().file_image(card_path)
+                    await self.context.send_message(umo, chain)
+                    return
+                except Exception as e:
+                    logger.error(f"发送渲染图片失败: {e}")
+                finally:
+                    try:
+                        os.unlink(card_path)
+                    except OSError:
+                        pass
+            # 渲染失败则回退文字模式
+            logger.warning("图片渲染失败，回退文字模式")
+            await self._send_news_text(umo, tag, news_data, images)
         else:
             # ── 文字模式 ──
             await self._send_news_text(umo, tag, news_data, images)
