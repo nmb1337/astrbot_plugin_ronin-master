@@ -261,7 +261,7 @@ class Jin10NewsPlugin(Star):
                 }
                 img_url = await self.html_render(NEWS_CARD_TMPL, render_data,
                                                  options={"type": "jpeg", "quality": 90})
-                chain = MessageChain().message("").image(img_url)
+                chain = [Comp.Image.fromURL(img_url)]
                 await self.context.send_message(umo, chain)
             except Exception as e:
                 logger.error(f"图片渲染失败，回退文字模式: {e}")
@@ -288,7 +288,7 @@ class Jin10NewsPlugin(Star):
         if self.show_images and images:
             for img_url in images[:3]:  # 最多3张
                 try:
-                    img_chain = MessageChain().message("").image(img_url)
+                    img_chain = [Comp.Image.fromURL(img_url)]
                     await self.context.send_message(umo, img_chain)
                     await asyncio.sleep(0.3)
                 except Exception as e:
