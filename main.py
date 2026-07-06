@@ -726,7 +726,6 @@ class Jin10NewsPlugin(Star):
 
     @filter.command("jin10")
     async def fetch_news(self, event: AstrMessageEvent, count: int = 0):
-        _stop_event(event)
         if count <= 0:
             count = self.default_count
         count = min(count, self.max_count)
@@ -760,7 +759,6 @@ class Jin10NewsPlugin(Star):
 
     @filter.command("jin10_watch")
     async def watch_news(self, event: AstrMessageEvent):
-        _stop_event(event)
         if not self.push_enabled:
             yield event.plain_result("⚠️ 自动推送功能未启用，请在插件配置中开启 push_enabled。")
             _stop_event(event)
@@ -776,7 +774,6 @@ class Jin10NewsPlugin(Star):
 
     @filter.command("jin10_unwatch")
     async def unwatch_news(self, event: AstrMessageEvent):
-        _stop_event(event)
         umo = event.unified_msg_origin
         removed = await self._remove_subscription(umo)
         if removed:
@@ -787,7 +784,6 @@ class Jin10NewsPlugin(Star):
 
     @filter.command("jin10_status")
     async def status_news(self, event: AstrMessageEvent):
-        _stop_event(event)
         subscriptions = await self._get_subscriptions()
         subscribed = event.unified_msg_origin in subscriptions
         known_ids = await self._get_known_ids()
