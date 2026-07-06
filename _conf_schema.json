@@ -65,5 +65,11 @@
     "type": "bool",
     "default": true,
     "hint": "开启后，会自动提取文章中的图片并发送（文字模式单独发图，图片模式嵌入卡片中）。"
+  },
+  "font_path": {
+    "description": "图片渲染中文字体路径",
+    "type": "string",
+    "default": "",
+    "hint": "当图片渲染出现方块/乱码时，填写服务器上的中文字体文件路径，例如 /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc 或 C:/Windows/Fonts/msyh.ttc。留空则自动查找。"
   }
 }

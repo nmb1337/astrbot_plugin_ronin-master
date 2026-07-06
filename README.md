@@ -53,12 +53,15 @@ pip install -r requirements.txt
 | `fetch_detail` | 自动抓取"点击查看"全文及图片 | `true` |
 | `output_mode` | 输出模式（`text`/`image`） | `text` |
 | `show_images` | 显示文章中图片 | `true` |
+| `font_path` | 图片渲染中文字体路径（留空自动查找） | 空 |
 
 一般无需修改，保持默认即可。
 
 ### 🖼️ 图片渲染模式
 
 将 `output_mode` 设为 `image` 后，新闻会以精美图片卡片形式发送（深色主题、标题醒目），文章内图片也会嵌入卡片中。
+
+如果图片里的中文显示为方块或乱码，说明运行 AstrBot 的服务器缺少可用中文字体。可安装 Noto Sans CJK / 文泉驿等字体，或把字体文件放到插件目录 `fonts/` 下，也可以在配置项 `font_path` 中填写字体文件绝对路径。
 
 ## 🔔 自动推送
 

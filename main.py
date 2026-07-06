@@ -2,7 +2,9 @@ import re
 import asyncio
 import json
 import os
+import subprocess
 import tempfile
+from functools import lru_cache
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
@@ -19,21 +21,107 @@ JIN10_DETAIL_URL = "https://flash.jin10.com/detail/{item_id}"
 
 # ──────────────── Pillow 本地图片渲染 ────────────────
 
-def _find_chinese_font() -> str | None:
-    """查找系统中可用的中文字体"""
+_FONT_EXTS = (".ttf", ".ttc", ".otf")
+_FONT_NAME_KEYWORDS = (
+    "cjk", "noto", "sourcehan", "source-han", "wqy", "wenquanyi",
+    "droidsansfallback", "fallback", "simsun", "simhei", "msyh",
+    "yahei", "pingfang", "hiragino", "song", "hei", "kaiti",
+    "fangsong", "sarasa", "harmonyos", "miui", "oppo",
+)
+
+
+def _is_font_file(path: str | None) -> bool:
+    return bool(path and os.path.isfile(path) and path.lower().endswith(_FONT_EXTS))
+
+
+def _looks_like_chinese_font(path: str) -> bool:
+    name = os.path.basename(path).lower()
+    return any(keyword in name for keyword in _FONT_NAME_KEYWORDS)
+
+
+@lru_cache(maxsize=16)
+def _find_chinese_font(config_font_path: str | None = None) -> str | None:
+    """查找系统中可用的中文字体，优先使用用户配置路径。"""
+    preferred = [
+        config_font_path,
+        os.getenv("ASTRBOT_JIN10_FONT"),
+        os.getenv("JIN10_FONT_PATH"),
+    ]
+    for path in preferred:
+        if _is_font_file(path):
+            return path
+
+    plugin_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
+        os.path.join(plugin_dir, "fonts", "NotoSansCJK-Regular.ttc"),
+        os.path.join(plugin_dir, "fonts", "NotoSansSC-Regular.ttf"),
+        os.path.join(plugin_dir, "fonts", "SourceHanSansSC-Regular.otf"),
         "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/msyhbd.ttc",
         "C:/Windows/Fonts/simhei.ttf",
         "C:/Windows/Fonts/simsun.ttc",
+        "C:/Windows/Fonts/Deng.ttf",
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Medium.otf",
+        "/usr/share/fonts/opentype/source-han-sans/SourceHanSansSC-Regular.otf",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/usr/share/fonts/truetype/droid/DroidSansFallback.ttf",
         "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
     ]
     for path in candidates:
-        if os.path.exists(path):
+        if _is_font_file(path):
             return path
+
+    search_roots = [
+        os.path.join(plugin_dir, "fonts"),
+        os.path.join(plugin_dir, "assets"),
+        "/usr/share/fonts",
+        "/usr/local/share/fonts",
+        "/app/fonts",
+        "/fonts",
+    ]
+    for root in search_roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for filename in filenames:
+                path = os.path.join(dirpath, filename)
+                if _is_font_file(path) and _looks_like_chinese_font(path):
+                    return path
+
+    for family in ("Noto Sans CJK SC", "Source Han Sans SC", "WenQuanYi Micro Hei", "SimHei"):
+        try:
+            result = subprocess.run(
+                ["fc-match", "-f", "%{file}", family],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except Exception:
+            continue
+        path = result.stdout.strip()
+        if _is_font_file(path) and _looks_like_chinese_font(path):
+            return path
+
     return None
+
+
+def _load_font(font_path: str | None, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    if font_path:
+        return ImageFont.truetype(font_path, size)
+    return ImageFont.load_default()
+
+
+def _stop_event(event: AstrMessageEvent):
+    stop_event = getattr(event, "stop_event", None)
+    if callable(stop_event):
+        stop_event()
 
 def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont,
                max_width: int) -> list[str]:
@@ -57,7 +145,8 @@ def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFon
     return lines
 
 def _render_news_card_sync(tag: str, title: str, time_str: str,
-                           content: str, image_paths: list[str]) -> str:
+                           content: str, image_paths: list[str],
+                           config_font_path: str | None = None) -> str:
     """使用 Pillow 本地渲染新闻卡片图片，返回临时文件路径"""
     W = 640
     PAD = 28
@@ -71,14 +160,17 @@ def _render_news_card_sync(tag: str, title: str, time_str: str,
     DARK_GRAY = (102, 102, 102)
     LINE_COLOR = (255, 255, 255, 25)
 
-    font_path = _find_chinese_font()
+    font_path = _find_chinese_font(config_font_path)
+    if not font_path:
+        logger.warning("未找到中文字体，图片渲染可能出现方块/乱码。请在配置 font_path 中填写中文字体文件路径。")
     try:
-        ft_title = ImageFont.truetype(font_path, 22) if font_path else ImageFont.load_default()
-        ft_body = ImageFont.truetype(font_path, 15) if font_path else ImageFont.load_default()
-        ft_time = ImageFont.truetype(font_path, 13) if font_path else ImageFont.load_default()
-        ft_tag = ImageFont.truetype(font_path, 12) if font_path else ImageFont.load_default()
-        ft_footer = ImageFont.truetype(font_path, 11) if font_path else ImageFont.load_default()
-    except Exception:
+        ft_title = _load_font(font_path, 22)
+        ft_body = _load_font(font_path, 15)
+        ft_time = _load_font(font_path, 13)
+        ft_tag = _load_font(font_path, 12)
+        ft_footer = _load_font(font_path, 11)
+    except Exception as exc:
+        logger.warning(f"加载字体失败：{font_path}, {exc}")
         ft_title = ft_body = ft_time = ft_tag = ft_footer = ImageFont.load_default()
 
     # 准备绘制用的 ImageDraw（用于测量）
@@ -213,6 +305,7 @@ class Jin10NewsPlugin(Star):
         self.fetch_detail = config.get("fetch_detail", True)
         self.output_mode = config.get("output_mode", "text")
         self.show_images = config.get("show_images", True)
+        self.font_path = config.get("font_path", "")
         self._poll_task: asyncio.Task | None = None
 
     async def initialize(self):
@@ -465,7 +558,7 @@ class Jin10NewsPlugin(Star):
         try:
             loop = asyncio.get_running_loop()
             card_path = await loop.run_in_executor(
-                None, _render_news_card_sync, tag, title, time_str, content, local_paths
+                None, _render_news_card_sync, tag, title, time_str, content, local_paths, self.font_path
             )
             return card_path
         except Exception as e:
@@ -632,6 +725,7 @@ class Jin10NewsPlugin(Star):
 
     @filter.command("jin10")
     async def fetch_news(self, event: AstrMessageEvent, count: int = 0):
+        _stop_event(event)
         if count <= 0:
             count = self.default_count
         count = min(count, self.max_count)
@@ -639,11 +733,13 @@ class Jin10NewsPlugin(Star):
         result = await self._fetch_news_api()
         if result is None:
             yield event.plain_result("⚠️ 获取新闻失败，请稍后再试。")
+            _stop_event(event)
             return
 
         news_list = result.get("data", [])[:count]
         if not news_list:
             yield event.plain_result("📭 当前暂无重要新闻。")
+            _stop_event(event)
             return
 
         umo = event.unified_msg_origin
@@ -659,11 +755,14 @@ class Jin10NewsPlugin(Star):
 
             news_data = self._build_news_data(item, full_text)
             await self._send_news(umo, i, len(news_list), news_data, images, is_push=False)
+        _stop_event(event)
 
     @filter.command("jin10_watch")
     async def watch_news(self, event: AstrMessageEvent):
+        _stop_event(event)
         if not self.push_enabled:
             yield event.plain_result("⚠️ 自动推送功能未启用，请在插件配置中开启 push_enabled。")
+            _stop_event(event)
             return
         umo = event.unified_msg_origin
         added = await self._add_subscription(umo)
@@ -672,18 +771,22 @@ class Jin10NewsPlugin(Star):
                                      "使用 /jin10_unwatch 可取消订阅。")
         else:
             yield event.plain_result("ℹ️ 本群已订阅，无需重复操作。")
+        _stop_event(event)
 
     @filter.command("jin10_unwatch")
     async def unwatch_news(self, event: AstrMessageEvent):
+        _stop_event(event)
         umo = event.unified_msg_origin
         removed = await self._remove_subscription(umo)
         if removed:
             yield event.plain_result("✅ 已取消金十新闻自动推送。")
         else:
             yield event.plain_result("ℹ️ 本群尚未订阅推送。")
+        _stop_event(event)
 
     @filter.command("jin10_status")
     async def status_news(self, event: AstrMessageEvent):
+        _stop_event(event)
         subscriptions = await self._get_subscriptions()
         subscribed = event.unified_msg_origin in subscriptions
         known_ids = await self._get_known_ids()
@@ -701,6 +804,7 @@ class Jin10NewsPlugin(Star):
             f"▪ 已跟踪新闻数：{len(known_ids)} 条",
         ]
         yield event.plain_result("\n".join(lines))
+        _stop_event(event)
 
     async def terminate(self):
         if self._poll_task:
