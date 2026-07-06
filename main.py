@@ -54,6 +54,7 @@ def _find_chinese_font(config_font_path: str | None = None) -> str | None:
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.path.join(plugin_dir, "fonts", "NotoSansCJK-Regular.ttc"),
+        os.path.join(plugin_dir, "fonts", "NotoSansCJKsc-Regular.otf"),
         os.path.join(plugin_dir, "fonts", "NotoSansSC-Regular.ttf"),
         os.path.join(plugin_dir, "fonts", "SourceHanSansSC-Regular.otf"),
         "C:/Windows/Fonts/msyh.ttc",

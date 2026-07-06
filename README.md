@@ -61,7 +61,7 @@ pip install -r requirements.txt
 
 将 `output_mode` 设为 `image` 后，新闻会以精美图片卡片形式发送（深色主题、标题醒目），文章内图片也会嵌入卡片中。
 
-如果图片里的中文显示为方块或乱码，说明运行 AstrBot 的服务器缺少可用中文字体。可安装 Noto Sans CJK / 文泉驿等字体，或把字体文件放到插件目录 `fonts/` 下，也可以在配置项 `font_path` 中填写字体文件绝对路径。
+插件已内置 Noto Sans CJK SC 字体用于图片渲染。若自行删掉 `fonts/` 目录，或需要改用服务器上的字体，可在配置项 `font_path` 中填写字体文件绝对路径。
 
 ## 🔔 自动推送
 
